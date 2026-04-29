@@ -170,8 +170,30 @@ func (list *ContainerImageList) ContainsImage(img *ContainerImage, checkVersion 
 		}
 	}
 	for _, image := range *list {
+		// Match by image name and registry URL first
 		if img.ImageName == image.ImageName && image.RegistryURL == img.RegistryURL {
-			if !checkVersion || image.ImageTag.TagName == img.ImageTag.TagName {
+			// If version checking is disabled, consider this a match immediately
+			if !checkVersion {
+				return image
+			}
+			imgTag := img.ImageTag
+			imageTag := image.ImageTag
+
+			// If the configured image has no version constraint, or the live image has no tag/digest,
+			// treat it as a match (same as if version checking was disabled)
+			if imgTag == nil || (imgTag.TagName == "" && imgTag.TagDigest == "") {
+				return image
+			}
+			// If the live image has no tag information, treat as a match
+			if imageTag == nil {
+				return image
+			}
+			// If both images have a digest and they match, treat as a match
+			if imgTag.TagDigest != "" && imageTag.TagDigest != "" && imgTag.TagDigest == imageTag.TagDigest {
+				return image
+			}
+			// If both images have a tag name and they match, treat as a match
+			if imgTag.TagName != "" && imageTag.TagName != "" && imgTag.TagName == imageTag.TagName {
 				return image
 			}
 		}

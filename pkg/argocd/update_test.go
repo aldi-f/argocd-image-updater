@@ -1931,6 +1931,135 @@ registries:
 			"Image should remain unchanged since digest is the same")
 	})
 
+	// Test for the bug where two configured images that share the same repository but
+	// track different tags with digest strategy would resolve to the same (first) live
+	// image entry. This caused the "no update needed" else-branch to call
+	// applicationImage.WithTag(updateableImage.ImageTag), using the wrong live
+	// image's tag name and writing it into the second image's Helm parameter.
+	t.Run("Test digest strategy with two images of same repo but different tags on Helm app does not overwrite each other", func(t *testing.T) {
+		// Use two tags that both resolve to the same digest. This forces the
+		// "no update needed" else-branch to fire for both images, which is the
+		// code path that used to write the wrong tag name.
+		sharedDigestBytes2 := [32]byte{
+			0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+			0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+			0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+			0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+		}
+		sharedDigest2 := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+		mockClientFn := func(endpoint *registry.RegistryEndpoint, username, password string) (registry.RegistryClient, error) {
+			regMock := regmock.RegistryClient{}
+			regMock.On("NewRepository", mock.Anything).Return(nil)
+			regMock.On("Tags", mock.Anything).Return([]string{"stable", "canary"}, nil)
+
+			metaStable := &schema1.SignedManifest{} //nolint:staticcheck
+			metaStable.Name = "myapp"
+			metaStable.Tag = "stable"
+			regMock.On("ManifestForTag", mock.Anything, "stable").Return(metaStable, nil)
+
+			metaCanary := &schema1.SignedManifest{} //nolint:staticcheck
+			metaCanary.Name = "myapp"
+			metaCanary.Tag = "canary"
+			regMock.On("ManifestForTag", mock.Anything, "canary").Return(metaCanary, nil)
+
+			// Both tags resolve to the same digest — this triggers the "no update
+			// needed" else-branch, which is where the tag-name overwrite happened.
+			regMock.On("TagMetadata", mock.Anything, mock.Anything, mock.Anything).Return(&tag.TagInfo{
+				CreatedAt: time.Now(),
+				Digest:    sharedDigestBytes2,
+			}, nil)
+
+			return &regMock, nil
+		}
+
+		argoClient := argomock.ArgoCD{}
+		argoClient.On("UpdateSpec", mock.Anything, mock.Anything).Return(nil, nil)
+
+		kubeClient := kube.ImageUpdaterKubernetesClient{
+			KubeClient: &registryKube.KubernetesClient{
+				Clientset: fake.NewFakeKubeClient(),
+			},
+		}
+
+		// Image 1: track the "stable" tag, write to "stable.image" Helm param.
+		imgStable := NewImage(image.NewFromIdentifier("stable=registry.io/myapp:stable"))
+		imgStable.HelmImageSpec = "stable.image"
+		imgStable.UpdateStrategy = image.StrategyDigest
+
+		// Image 2: same repo, different tag, different Helm param.
+		imgCanary := NewImage(image.NewFromIdentifier("canary=registry.io/myapp:canary"))
+		imgCanary.HelmImageSpec = "canary.image"
+		imgCanary.UpdateStrategy = image.StrategyDigest
+
+		appImages := &ApplicationImages{
+			Application: v1alpha1.Application{
+				ObjectMeta: v1.ObjectMeta{
+					Name:      "myapp",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.ApplicationSpec{
+					Source: &v1alpha1.ApplicationSource{
+						Helm: &v1alpha1.ApplicationSourceHelm{
+							Parameters: []v1alpha1.HelmParameter{
+								// Both params already carry the shared digest so no
+								// update is needed. The else-branch will be executed
+								// for both images to "re-affirm" the current values.
+								{Name: "stable.image", Value: "registry.io/myapp:stable@" + sharedDigest2},
+								{Name: "canary.image", Value: "registry.io/myapp:canary@" + sharedDigest2},
+							},
+						},
+					},
+				},
+				Status: v1alpha1.ApplicationStatus{
+					SourceType: v1alpha1.ApplicationSourceTypeHelm,
+					Summary: v1alpha1.ApplicationSummary{
+						Images: []string{
+							"registry.io/myapp:stable@" + sharedDigest2,
+							"registry.io/myapp:canary@" + sharedDigest2,
+						},
+					},
+				},
+			},
+			Images: ImageList{imgStable, imgCanary},
+			WriteBackConfig: &WriteBackConfig{
+				Method: WriteBackApplication,
+			},
+		}
+
+		res := UpdateApplication(context.Background(), &UpdateConfiguration{
+			NewRegFN:   mockClientFn,
+			ArgoClient: &argoClient,
+			KubeClient: &kubeClient,
+			UpdateApp:  appImages,
+			DryRun:     false,
+		}, NewSyncIterationState())
+
+		assert.Equal(t, 0, res.NumErrors)
+		assert.Equal(t, 2, res.NumImagesConsidered)
+		assert.Equal(t, 0, res.NumImagesUpdated, "no update expected when both digests are already current")
+
+		// Both Helm parameters must retain their own tag names.
+		// Before the fix, the second image's Helm parameter (canary.image) would be
+		// overwritten with the first image's (stable) tag name, because
+		// ContainsImage(false) always returned the first live entry for both lookups.
+		params := appImages.Application.Spec.Source.Helm.Parameters
+		var stableValue, canaryValue string
+		for _, p := range params {
+			switch p.Name {
+			case "stable.image":
+				stableValue = p.Value
+			case "canary.image":
+				canaryValue = p.Value
+			}
+		}
+
+		assert.Equal(t, "registry.io/myapp:stable@"+sharedDigest2, stableValue,
+			"stable.image must keep the 'stable' tag name")
+		assert.Equal(t, "registry.io/myapp:canary@"+sharedDigest2, canaryValue,
+			"canary.image must keep the 'canary' tag name and must not be overwritten with 'stable'")
+	})
+
 }
 
 func Test_MarshalParamsOverride(t *testing.T) {

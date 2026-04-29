@@ -57,8 +57,16 @@ func UpdateApplication(ctx context.Context, updateConf *UpdateConfiguration, sta
 	// constraints which are part of the application's values.
 	//
 	for _, applicationImage := range updateConf.UpdateApp.Images {
+		// Try an exact version match first (e.g. digest strategy tracking a specific tag),
+		// then fall back to a name/registry-only match (e.g. semver strategy where the
+		// constraint string differs from the live tag). This prevents two configured images
+		// that share the same repository but track different tags from both resolving to the
+		// same (first) live image entry.
 		// updateableImage is the live image found in the cluster status
-		updateableImage := applicationImages.ContainsImage(applicationImage.ContainerImage, false)
+		updateableImage := applicationImages.ContainsImage(applicationImage.ContainerImage, true)
+		if updateableImage == nil {
+			updateableImage = applicationImages.ContainsImage(applicationImage.ContainerImage, false)
+		}
 		if updateableImage == nil {
 			baseLogger.Debugf("Image '%s' seems not to be live in this application, skipping", applicationImage.ImageName)
 			result.NumSkipped += 1

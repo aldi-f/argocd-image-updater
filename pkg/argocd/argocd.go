@@ -891,15 +891,40 @@ func SetKustomizeImage(ctx context.Context, app *argocdapi.Application, newImage
 		appSource.Kustomize = &argocdapi.ApplicationSourceKustomize{}
 	}
 
+	override := image.NewFromIdentifier(ksImageParam)
+
+	// Find the best kustomize entry to update.
+	// When the same image repository appears multiple times with different tags
+	// (e.g. two containers tracking "stable" and "canary" of the same repo via
+	// digest strategy), we must not overwrite a sibling entry. Strategy:
+	//   1. Prefer an exact tag-name match — the tag is stable, so it uniquely
+	//      identifies which kustomize entry belongs to this configured image.
+	//   2. Fall back to the first name+registry match (preserves the original
+	//      single-image behaviour and handles semver where the tag changes).
+	bestIdx := -1
 	for i, kImg := range appSource.Kustomize.Images {
 		curr := image.NewFromIdentifier(string(kImg))
-		override := image.NewFromIdentifier(ksImageParam)
 
-		if curr.ImageName == override.ImageName {
-			curr.ImageAlias = override.ImageAlias
-			appSource.Kustomize.Images[i] = argocdapi.KustomizeImage(override.String())
+		if curr.ImageName != override.ImageName {
+			continue
 		}
 
+		// Exact tag-name match: highest priority.
+		if curr.ImageTag != nil && override.ImageTag != nil &&
+			curr.ImageTag.TagName != "" && override.ImageTag.TagName != "" &&
+			curr.ImageTag.TagName == override.ImageTag.TagName {
+			bestIdx = i
+			break // no better match is possible
+		}
+
+		// First name+registry match: keep as fallback.
+		if bestIdx == -1 {
+			bestIdx = i
+		}
+	}
+
+	if bestIdx >= 0 {
+		appSource.Kustomize.Images[bestIdx] = argocdapi.KustomizeImage(override.String())
 	}
 
 	appSource.Kustomize.MergeImage(argocdapi.KustomizeImage(ksImageParam))
